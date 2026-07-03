@@ -1,4 +1,4 @@
-import { MODULE_ID, SYSTEM_ID } from "./config.mjs";
+import { MODULE_ID, SYSTEM_ID, HOOK_DAMAGE_APPLIED, HOOK_DAMAGE_UNDONE, HOOK_STATUS_APPLIED, HOOK_STATUS_UNDONE } from "./config.mjs";
 import { initializeAoeTargeting } from "./aoe-targeting.mjs";
 import { initializeMinionAutomation } from "./minion-automation.mjs";
 import { applyHideSystemButtons, registerSettings } from "./settings.mjs";
@@ -24,6 +24,10 @@ Hooks.once("init", () => {
   // even if the ready hook bails early.
   game.modules.get(MODULE_ID).api = {
     debugLastMessage: getChatTargetingDebugInfo,
+    HOOK_DAMAGE_APPLIED,
+    HOOK_DAMAGE_UNDONE,
+    HOOK_STATUS_APPLIED,
+    HOOK_STATUS_UNDONE,
   };
   console.log(`${MODULE_ID} | init complete, api exposed`);
 });

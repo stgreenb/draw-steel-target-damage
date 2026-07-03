@@ -1,4 +1,4 @@
-import { localize, TARGETED_STATUS_IDS } from "./config.mjs";
+import { localize, TARGETED_STATUS_IDS, HOOK_DAMAGE_APPLIED, HOOK_DAMAGE_UNDONE, HOOK_STATUS_APPLIED, HOOK_STATUS_UNDONE } from "./config.mjs";
 import {
   applySquadMinionDamage,
   applySquadMinionHealing,
@@ -10,6 +10,88 @@ import {
 import { userCanApplyForMessage, userCanApplyForTarget } from "./permissions.mjs";
 import { getMessageAuthorId, getPart, resolveTarget } from "./target-utils.mjs";
 import { getMessageState, mutateMessageState } from "./state.mjs";
+
+function getIdFromUuid(uuid) {
+  if (!uuid) return null;
+  const parts = uuid.split(".");
+  return parts.length > 1 ? parts[parts.length - 1] : null;
+}
+
+function buildHookPayload(operationType, status, record, message, state, contextUser, preResolvedItem) {
+  const isApplied = status === "applied";
+  const eventId = foundry?.utils?.randomID?.() ?? crypto.randomUUID();
+  const timestamp = Date.now();
+
+  let sourceActorUuid = state?.sourceActorUuid ?? null;
+  let sourceTokenUuid = state?.sourceTokenUuid ?? null;
+  let sourceUserId = state?.sourceUserId ?? null;
+  let sourceUserName = state?.sourceUserName ?? null;
+
+  let sourceItemName = null;
+  let sourceItemUuid = null;
+  let keywords = [];
+
+  if (preResolvedItem) {
+    sourceItemName = preResolvedItem.name ?? null;
+    sourceItemUuid = preResolvedItem.uuid ?? null;
+    if (Array.isArray(preResolvedItem.system?.keywords)) {
+      keywords = [...preResolvedItem.system.keywords];
+    }
+  } else if (state?.abilityUuid) {
+    sourceItemUuid = state.abilityUuid;
+  }
+
+  let targetActorUuid = null;
+  let targetTokenUuid = null;
+  let targetActorName = null;
+
+  if (record?.target) {
+    targetActorUuid = record.target.actorUuid ?? null;
+    targetTokenUuid = record.target.tokenUuid ?? null;
+    targetActorName = record.target.name ?? null;
+  }
+
+  const payload = {
+    operationType,
+    status,
+    sourceActorId: getIdFromUuid(sourceActorUuid),
+    sourceActorUuid,
+    sourceTokenId: getIdFromUuid(sourceTokenUuid),
+    sourceTokenUuid,
+    sourceItemName,
+    sourceItemUuid,
+    sourceUserId,
+    sourceUserName,
+    targetActorId: getIdFromUuid(targetActorUuid),
+    targetActorUuid,
+    targetTokenId: getIdFromUuid(targetTokenUuid),
+    targetTokenUuid,
+    targetActorName,
+    keywords,
+    eventId,
+    timestamp,
+    isApplied,
+  };
+
+  if (operationType === "damage" || operationType === "healing") {
+    payload.amount = record?.amount ?? null;
+    payload.originalAmount = record?.originalAmount ?? null;
+    payload.halfDamage = record?.halfDamage ?? false;
+    payload.damageType = record?.damageType ?? null;
+    payload.typeLabel = record?.typeLabel ?? null;
+    payload.isHealing = operationType === "healing";
+    payload.isCritical = record?.isCritical ?? false;
+  }
+
+  if (operationType === "status") {
+    payload.effectId = record?.effectId ?? null;
+    payload.effectUuid = record?.effectUuid ?? null;
+    payload.statusName = record?.statusName ?? null;
+    payload.tier = record?.tier ?? null;
+  }
+
+  return payload;
+}
 
 export async function applyDamageOperation(payload, context) {
   const { message, roll } = getRollContext(payload, { allowSynthetic: !!payload.syntheticDamage });
@@ -29,6 +111,8 @@ export async function applyDamageOperation(payload, context) {
   assertCanApplyForTargets(context.user, message, state, applicationTargets, payload);
   const operationTargets = areaAbility ? getContextTargets(payload, applicationTargets) : applicationTargets;
   const surgeSpend = await prepareSurgeSpend(message, state, override, isHeal, applicationTargets.length);
+  const preResolvedItem = state?.abilityUuid ? await fromUuid(state.abilityUuid).catch(() => null) : null;
+  const operationType = isHeal ? "healing" : "damage";
   const records = [];
 
   let surgesSpent = false;
@@ -70,6 +154,16 @@ export async function applyDamageOperation(payload, context) {
 
   if (payload.selectedTokenStack) await pushApplicationRecord(message.id, payload.operationId, record, payload, context.user);
   else await writeApplicationRecord(message.id, payload.operationId, record, payload, context.user);
+
+  for (const targetRecord of records) {
+    const hookPayload = buildHookPayload(operationType, "applied", targetRecord, message, state, context.user, preResolvedItem);
+    try {
+      Hooks.callAll(HOOK_DAMAGE_APPLIED, hookPayload);
+    } catch (error) {
+      console.warn("draw-steel-target-damage | Hook dstd:damageApplied failed:", error);
+    }
+  }
+
   return { success: true, record };
 }
 
@@ -81,12 +175,26 @@ export async function undoDamageOperation(payload, context) {
   if (!prior) throw new Error("No applied damage record was found");
   assertCanApplyForTargets(context.user, message, state, getRecordTargets(prior), payload);
 
+  const preResolvedItem = state?.abilityUuid ? await fromUuid(state.abilityUuid).catch(() => null) : null;
+
   const record = Array.isArray(prior.records)
     ? await undoDamageBatch(prior, context.user)
     : await undoDamageRecord(prior, context.user);
 
   if (payload.selectedTokenStack || isStackedApplication(entry)) await popApplicationRecord(message.id, payload.operationId, record, payload, context.user);
   else await writeApplicationRecord(message.id, payload.operationId, record, payload, context.user);
+
+  const operationType = record.kind === "healing" ? "healing" : "damage";
+  const undoRecords = Array.isArray(record.records) ? record.records : [record];
+  for (const undoRecord of undoRecords) {
+    const hookPayload = buildHookPayload(operationType, "undone", undoRecord, message, state, context.user, preResolvedItem);
+    try {
+      Hooks.callAll(HOOK_DAMAGE_UNDONE, hookPayload);
+    } catch (error) {
+      console.warn("draw-steel-target-damage | Hook dstd:damageUndone failed:", error);
+    }
+  }
+
   return { success: true, record };
 }
 
@@ -188,6 +296,7 @@ export async function applyStatusOperation(payload, context) {
   const statusName = getStatusName(powerEffect, payload.effectId);
   const applicationTargets = getApplicationTargets(payload);
   assertCanApplyForTargets(context.user, message, state, applicationTargets, payload);
+  const preResolvedItem = state?.abilityUuid ? await fromUuid(state.abilityUuid).catch(() => null) : null;
   const records = [];
 
   for (const target of applicationTargets) {
@@ -203,6 +312,16 @@ export async function applyStatusOperation(payload, context) {
 
   if (payload.selectedTokenStack) await pushApplicationRecord(message.id, payload.operationId, record, payload, context.user);
   else await writeApplicationRecord(message.id, payload.operationId, record, payload, context.user);
+
+  for (const targetRecord of records) {
+    const hookPayload = buildHookPayload("status", "applied", targetRecord, message, state, context.user, preResolvedItem);
+    try {
+      Hooks.callAll(HOOK_STATUS_APPLIED, hookPayload);
+    } catch (error) {
+      console.warn("draw-steel-target-damage | Hook dstd:statusApplied failed:", error);
+    }
+  }
+
   return { success: true, record };
 }
 
@@ -214,12 +333,25 @@ export async function undoStatusOperation(payload, context) {
   if (!prior) throw new Error("No applied status record was found");
   assertCanApplyForTargets(context.user, message, state, getRecordTargets(prior), payload);
 
+  const preResolvedItem = state?.abilityUuid ? await fromUuid(state.abilityUuid).catch(() => null) : null;
+
   const record = Array.isArray(prior.records)
     ? await undoStatusBatch(prior, context.user)
     : await undoStatusRecord(prior, context.user);
 
   if (payload.selectedTokenStack || isStackedApplication(entry)) await popApplicationRecord(message.id, payload.operationId, record, payload, context.user);
   else await writeApplicationRecord(message.id, payload.operationId, record, payload, context.user);
+
+  const undoRecords = Array.isArray(record.records) ? record.records : [record];
+  for (const undoRecord of undoRecords) {
+    const hookPayload = buildHookPayload("status", "undone", undoRecord, message, state, context.user, preResolvedItem);
+    try {
+      Hooks.callAll(HOOK_STATUS_UNDONE, hookPayload);
+    } catch (error) {
+      console.warn("draw-steel-target-damage | Hook dstd:statusUndone failed:", error);
+    }
+  }
+
   return { success: true, record };
 }
 
